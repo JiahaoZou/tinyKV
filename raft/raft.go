@@ -16,12 +16,18 @@ package raft
 
 import (
 	"errors"
+	"fmt"
+	"math/rand"
+	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 // None is a placeholder node ID used when there is no leader.
 const None uint64 = 0
+
+// 是否开启log
+const debug = true
 
 // StateType represents the role of a node in a cluster.
 type StateType uint64
@@ -36,6 +42,18 @@ var stmap = [...]string{
 	"StateFollower",
 	"StateCandidate",
 	"StateLeader",
+}
+
+func (s *StateType) StateInfo() string {
+	switch *s {
+	case StateFollower:
+		return "follower"
+	case StateCandidate:
+		return "candidate"
+	case StateLeader:
+		return "leader"
+	}
+	return ""
 }
 
 func (st StateType) String() string {
@@ -107,16 +125,26 @@ type Progress struct {
 	Match, Next uint64
 }
 
+// 用到了一个消息结构
+// Msg 分为 Local Msg 和 Common Msg。前者是本地发起的 Msg，多为上层传递下来的，
+// 比如提交条目、请求心跳、请求选举等等，这些 Msg 不会在节点之间传播，它们的 term 也相应的等于 0。
+// 后者就是节点之间发送的 Msg，用来集群之间的同步。
+
 type Raft struct {
+	// 配置信息
+	config Config
+	// raft id
 	id uint64
-
+	// 任期
 	Term uint64
+	// 当前投票给的ID
 	Vote uint64
-
 	// the log
+	// log管理器
 	RaftLog *RaftLog
 
 	// log replication progress of each peers
+	// 即match数组和next数组
 	Prs map[uint64]*Progress
 
 	// this peer's role
@@ -157,6 +185,7 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+	transferElapsed  int
 }
 
 // newRaft return a raft peer with the given config
@@ -165,7 +194,36 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	r := &Raft{
+		config:           *c,
+		id:               c.ID,
+		Prs:              make(map[uint64]*Progress),
+		votes:            make(map[uint64]bool),
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+		RaftLog:          newLog(c.Storage),
+	}
+	// 取得已经保存的raft节点状态，用于raft节点的重启或是创建
+	// 初始化的数据是由storage从配置文件里读的
+	hardSt, confSt, _ := r.RaftLog.storage.InitialState()
+	if c.peers == nil {
+		c.peers = confSt.Nodes
+	}
+	lastIndex := r.RaftLog.LastIndex()
+	for _, peer := range c.peers {
+		if peer == r.id {
+			r.Prs[peer] = &Progress{Next: lastIndex + 1, Match: lastIndex}
+		} else {
+			r.Prs[peer] = &Progress{Next: lastIndex + 1}
+		}
+	}
+	r.becomeFollower(0, None)
+	r.resetElectionTimeout()
+	r.Term, r.Vote, r.RaftLog.committed = hardSt.GetTerm(), hardSt.GetVote(), hardSt.GetCommit()
+	if c.Applied > 0 {
+		r.RaftLog.applied = c.Applied
+	}
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -201,16 +259,125 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 }
 
+// Step() 作为驱动器，用来接收上层发来的 Msg，然后根据不同的角色和不同的 MsgType 进行不同的处理。
+// 首先，通过 switch-case 将 Step() 按照角色分为三个函数，
+// 分别为：FollowerStep() 、CandidateStep()、LeaderStep() 。
+// 接着，按照不同的 MsgTaype，将每个 XXXStep() 分为 12 个部分，用来处理不同的 Msg。
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	r.Log("handle step")
+	// lab3中内容，现在不需要太在意
+	if _, ok := r.Prs[r.id]; !ok && m.MsgType == pb.MessageType_MsgTimeoutNow {
+		return nil
+	}
+	if m.Term > r.Term {
+		// 根据论文，任何raft收到大term的消息都要变成follower
+		r.leadTransferee = None
+		r.becomeFollower(m.Term, None)
+	}
 	switch r.State {
 	case StateFollower:
+		r.FollowerStep(m)
 	case StateCandidate:
+		r.CandidateStep(m)
 	case StateLeader:
+		r.LeaderStep(m)
 	}
 	return nil
+}
+
+func (r *Raft) FollowerStep(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.doElection()
+	case pb.MessageType_MsgBeat:
+	case pb.MessageType_MsgPropose:
+	case pb.MessageType_MsgAppend:
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgAppendResponse:
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgHeartbeatResponse:
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+	case pb.MessageType_MsgTimeoutNow:
+		r.doElection()
+	}
+}
+
+func (r *Raft) CandidateStep(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.doElection()
+	case pb.MessageType_MsgBeat:
+	case pb.MessageType_MsgPropose:
+	case pb.MessageType_MsgAppend:
+		if m.Term == r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgAppendResponse:
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+		r.handleRequestVoteResponse(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
+	case pb.MessageType_MsgHeartbeat:
+		if m.Term == r.Term {
+			r.becomeFollower(m.Term, m.From)
+		}
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgHeartbeatResponse:
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+	case pb.MessageType_MsgTimeoutNow:
+	}
+}
+
+func (r *Raft) LeaderStep(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+	case pb.MessageType_MsgBeat:
+		r.broadcastHeartbeat()
+	case pb.MessageType_MsgPropose:
+		if r.leadTransferee == None {
+			r.appendEntries(m.Entries)
+		}
+	case pb.MessageType_MsgAppend:
+		r.handleAppendEntries(m)
+	case pb.MessageType_MsgAppendResponse:
+		r.handleAppendEntriesResponse(m)
+	case pb.MessageType_MsgRequestVote:
+		r.handleRequestVote(m)
+	case pb.MessageType_MsgRequestVoteResponse:
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.handleHeartbeat(m)
+	case pb.MessageType_MsgHeartbeatResponse:
+		r.sendAppend(m.From)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	case pb.MessageType_MsgTimeoutNow:
+	}
+}
+
+func (r *Raft) doElection() {
+
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -236,4 +403,27 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// resetElectionTimeout 重置ElectionTimeout为随机数
+func (r *Raft) resetElectionTimeout() {
+	rand.Seed(time.Now().UnixNano())
+	r.electionTimeout = r.config.ElectionTick + rand.Intn(r.config.ElectionTick)
+}
+
+func (r *Raft) GetId() uint64 {
+	return r.id
+}
+
+func (r *Raft) Log(format string, args ...interface{}) {
+	if debug {
+		outputColor := 30 + r.id
+		sprintf := fmt.Sprintf("%c[0;40;%dm id[%v]state[%v]term[%v]commited[%v]applied[%v]stabled[%d]: %c[0m",
+			0x1B, outputColor, r.id, r.State.StateInfo(), r.Term, r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.stabled, 0x1B)
+		if len(args) != 0 {
+			fmt.Printf(sprintf+format+"\n", args...)
+		} else {
+			fmt.Printf(sprintf + format + "\n")
+		}
+	}
 }

@@ -88,11 +88,33 @@ func newLog(storage Storage) *RaftLog {
 	return raftLog
 }
 
+// 将index转换成实际entrys数组的下标，用于产生了快照的情况
+func (l *RaftLog) toSliceIndex(i uint64) int {
+	idx := int(i - l.FirstIndex)
+	if idx < 0 {
+		panic("toSliceIndex: index < 0")
+	}
+	return idx
+}
+
+func (l *RaftLog) toEntryIndex(i int) uint64 {
+	return uint64(i) + l.FirstIndex
+}
+
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	first, _ := l.storage.FirstIndex()
+	if first > l.FirstIndex {
+		if len(l.entries) > 0 {
+			entries := l.entries[l.toSliceIndex(first):]
+			l.entries = make([]pb.Entry, len(entries))
+			copy(l.entries, entries)
+		}
+		l.FirstIndex = first
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -100,7 +122,10 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	if l.entries == nil || len(l.entries) == 0 {
+		return nil
+	}
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
